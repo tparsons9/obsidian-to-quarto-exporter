@@ -1,6 +1,7 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, getAllTags} from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, getAllTags, FileSystemAdapter } from 'obsidian';
 import * as path from 'path';
 import * as fs from 'fs';
+import { exec } from 'child_process';
 
 interface ObsidianToQuartoSettings {
     dateOption: 'none' | 'created' | 'modified';
@@ -33,6 +34,12 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             callback: () => this.exportToQuarto(),
         });
 
+        this.addCommand({
+            id: 'open-exported-qmd-vscode',
+            name: 'Open Exported QMD in VS Code Insiders',
+            callback: () => this.openExportedInVSCode(),
+        });
+
         this.addSettingTab(new ObsidianToQuartoSettingTab(this.app, this));
         console.log('ObsidianToQuartoPlugin loaded');
     }
@@ -54,15 +61,15 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             }
 
             const content = await this.app.vault.read(activeFile);
-            const convertedContent = await this.convertToQuarto(content, activeFile);
-            
+
             let outputPath: string;
             let newFileName = activeFile.basename + '.qmd';
             let newPath: string;
+            let qmdRelativePath: string;
 
             if (this.settings.allowExternalPaths && path.isAbsolute(this.settings.outputFolder)) {
                 // Handle absolute path outside vault
-                outputPath = this.settings.outputFolder;
+                outputPath = path.join(this.settings.outputFolder, activeFile.parent.path);
                 try {
                     fs.mkdirSync(outputPath, { recursive: true });
                     newPath = path.join(outputPath, newFileName);
@@ -80,7 +87,16 @@ export default class ObsidianToQuartoPlugin extends Plugin {
                         }
                     }
 
+                    qmdRelativePath = newPath;
+                    const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath);
                     fs.writeFileSync(newPath, convertedContent);
+
+                    // Update original MD file with bidirectional link
+                    await this.addFrontmatterProperty(activeFile, 'code', `[[${qmdRelativePath}]]`);
+
+                    // Insert button to open file in VS Code Insiders
+                    await this.insertButtonCodeblock(activeFile);
+
                     new Notice(`Successfully exported to ${newPath}`);
                 } catch (error) {
                     console.error('Error writing to external path:', error);
@@ -89,9 +105,11 @@ export default class ObsidianToQuartoPlugin extends Plugin {
                 }
             } else {
                 // Handle vault path
-                outputPath = this.settings.outputFolder || activeFile.parent.path;
+                outputPath = this.settings.outputFolder
+                    ? path.join(this.settings.outputFolder, activeFile.parent.path)
+                    : activeFile.parent.path;
                 await this.app.vault.adapter.mkdir(outputPath);
-                
+
                 newPath = `${outputPath}/${newFileName}`;
                 if (await this.app.vault.adapter.exists(newPath)) {
                     if (this.settings.overwriteExisting) {
@@ -106,11 +124,16 @@ export default class ObsidianToQuartoPlugin extends Plugin {
                     }
                 }
 
+                qmdRelativePath = newPath;
+                const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath);
                 await this.app.vault.create(newPath, convertedContent);
-                const newFile = this.app.vault.getAbstractFileByPath(newPath);
-                if (newFile instanceof TFile) {
-                    await this.app.workspace.openLinkText(newFile.path, '', true);
-                }
+
+                // Update original MD file with bidirectional link
+                await this.addFrontmatterProperty(activeFile, 'code', `[[${qmdRelativePath}]]`);
+
+                // Insert button to open file in VS Code Insiders
+                await this.insertButtonCodeblock(activeFile);
+
                 new Notice(`Successfully exported to ${newFileName}`);
             }
         } catch (error) {
@@ -119,12 +142,77 @@ export default class ObsidianToQuartoPlugin extends Plugin {
         }
     }
 
+    async openExportedInVSCode() {
+        try {
+            const activeFile = this.app.workspace.getActiveFile();
+            if (!activeFile || activeFile.extension !== 'md') {
+                new Notice('Please open a Markdown file with exported QMD');
+                return;
+            }
+
+            // Read frontmatter to get the code property
+            const content = await this.app.vault.read(activeFile);
+            const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
+
+            if (!frontmatterMatch) {
+                new Notice('No frontmatter found. Export a QMD file first.');
+                return;
+            }
+
+            const frontmatterContent = frontmatterMatch[1];
+            const codeMatch = frontmatterContent.match(/^code:\s*"?\[\[(.+?)\]\]"?$/m);
+
+            if (!codeMatch) {
+                new Notice('No exported QMD file found in frontmatter. Export a QMD file first.');
+                return;
+            }
+
+            let qmdPath = codeMatch[1];
+
+            // Handle both absolute and relative paths
+            let absoluteFilePath: string;
+            if (path.isAbsolute(qmdPath)) {
+                absoluteFilePath = qmdPath;
+            } else {
+                // Relative to vault
+                if (this.app.vault.adapter instanceof FileSystemAdapter) {
+                    absoluteFilePath = path.join(this.app.vault.adapter.getBasePath(), qmdPath);
+                } else {
+                    new Notice('Cannot determine absolute path');
+                    return;
+                }
+            }
+
+            // Get the folder path
+            const folderPath = path.dirname(absoluteFilePath);
+
+            // Execute code-insiders command to open both folder and file
+            const command = `code-insiders "${folderPath}" "${absoluteFilePath}"`;
+
+            exec(command, (error, stdout, stderr) => {
+                if (error) {
+                    console.error('Error opening in VS Code:', error);
+                    new Notice(`Failed to open in VS Code Insiders: ${error.message}`);
+                    return;
+                }
+                if (stderr) {
+                    console.error('VS Code stderr:', stderr);
+                }
+                new Notice('Opened in VS Code Insiders');
+            });
+
+        } catch (error) {
+            console.error('Error in openExportedInVSCode:', error);
+            new Notice('Failed to open in VS Code Insiders. Check console for details.');
+        }
+    }
+
     convertObsidianImages(content: string): string {
         // Convert Obsidian image syntax (![[image.png]]) to standard Markdown (![](<image.png>))
         return content.replace(/!\[\[([^\]]+?)\]\]/g, '![]($1)');
     }
 
-    async convertToQuarto(content: string, file: TFile): Promise<string> {
+    async convertToQuarto(content: string, file: TFile, qmdRelativePath?: string): Promise<string> {
         // Extract frontmatter if it exists
         let frontmatter = '';
         let mainContent = content;
@@ -149,6 +237,11 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             if (fileTags.length > 0) {
                 newFrontmatter += `tags:\n${fileTags.map(tag => `  - ${tag}`).join('\n')}\n`;
             }
+        }
+
+        // Add bidirectional link to original note
+        if (qmdRelativePath) {
+            newFrontmatter += `note: "[[${file.path}]]"\n`;
         }
 
         // Merge existing frontmatter (if any) with new frontmatter, excluding tags
@@ -328,6 +421,88 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             .toLowerCase()
             .replace(/[^\w ]+/g, '')
             .replace(/ +/g, '-');
+    }
+
+    async addFrontmatterProperty(file: TFile, key: string, value: string): Promise<void> {
+        try {
+            const content = await this.app.vault.read(file);
+            const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
+
+            if (frontmatterMatch) {
+                // Frontmatter exists, add/update property
+                const frontmatterContent = frontmatterMatch[1];
+                const lines = frontmatterContent.split('\n');
+
+                // Check if property already exists
+                const propertyIndex = lines.findIndex(line => line.startsWith(`${key}:`));
+                if (propertyIndex !== -1) {
+                    // Update existing property
+                    lines[propertyIndex] = `${key}: "${value}"`;
+                } else {
+                    // Add new property
+                    lines.push(`${key}: "${value}"`);
+                }
+
+                const newFrontmatter = `---\n${lines.join('\n')}\n---\n`;
+                const newContent = content.replace(/^---\n[\s\S]*?\n---\n/, newFrontmatter);
+                await this.app.vault.modify(file, newContent);
+            } else {
+                // No frontmatter exists, create it
+                const newFrontmatter = `---\n${key}: "${value}"\n---\n\n`;
+                const newContent = newFrontmatter + content;
+                await this.app.vault.modify(file, newContent);
+            }
+        } catch (error) {
+            console.error('Error adding frontmatter property:', error);
+            new Notice(`Failed to update frontmatter: ${error.message}`);
+        }
+    }
+
+    async insertButtonCodeblock(file: TFile): Promise<void> {
+        try {
+            const content = await this.app.vault.read(file);
+            const buttonCodeblock = `\`\`\`button
+name Open in VS Code Insiders
+type command
+action Quarto Exporter: Open Exported QMD in VS Code Insiders
+color blue
+\`\`\`\n\n`;
+
+            // Check if button already exists (check for all previous names)
+            if (content.includes('name Open in VS Code Insiders') || content.includes('name Open QMD Workspace') || content.includes('name Open Exported QMD')) {
+                // Remove old button first
+                const buttonRegex = /```button\s+name Open (?:in VS Code Insiders|QMD Workspace|Exported QMD)[\s\S]*?```\n*/;
+                const contentWithoutButton = content.replace(buttonRegex, '');
+                const frontmatterMatch = contentWithoutButton.match(/^---\n[\s\S]*?\n---\n\n?/);
+
+                if (frontmatterMatch) {
+                    const frontmatter = frontmatterMatch[0];
+                    const restContent = contentWithoutButton.slice(frontmatter.length);
+                    const newContent = frontmatter + buttonCodeblock + restContent;
+                    await this.app.vault.modify(file, newContent);
+                } else {
+                    const newContent = buttonCodeblock + contentWithoutButton;
+                    await this.app.vault.modify(file, newContent);
+                }
+            } else {
+                // Insert button after frontmatter
+                const frontmatterMatch = content.match(/^---\n[\s\S]*?\n---\n\n?/);
+
+                if (frontmatterMatch) {
+                    const frontmatter = frontmatterMatch[0];
+                    const restContent = content.slice(frontmatter.length);
+                    const newContent = frontmatter + buttonCodeblock + restContent;
+                    await this.app.vault.modify(file, newContent);
+                } else {
+                    // No frontmatter, insert at beginning
+                    const newContent = buttonCodeblock + content;
+                    await this.app.vault.modify(file, newContent);
+                }
+            }
+        } catch (error) {
+            console.error('Error inserting button codeblock:', error);
+            new Notice(`Failed to insert button: ${error.message}`);
+        }
     }
 }
 
