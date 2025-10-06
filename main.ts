@@ -10,6 +10,7 @@ interface ObsidianToQuartoSettings {
     overwriteExisting: boolean;
     importTags: boolean;
     allowExternalPaths: boolean;
+    htmlTheme: string;
 }
 
 const DEFAULT_SETTINGS: ObsidianToQuartoSettings = {
@@ -18,7 +19,8 @@ const DEFAULT_SETTINGS: ObsidianToQuartoSettings = {
     outputFolder: '',
     overwriteExisting: false,
     importTags: true,
-    allowExternalPaths: false
+    allowExternalPaths: false,
+    htmlTheme: 'cosmo'
 }
 
 export default class ObsidianToQuartoPlugin extends Plugin {
@@ -244,14 +246,59 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             newFrontmatter += `note: "[[${file.path}]]"\n`;
         }
 
-        // Merge existing frontmatter (if any) with new frontmatter, excluding tags
+        // Add Quarto format configuration for HTML export
+        newFrontmatter += `format:\n`;
+        newFrontmatter += `  html:\n`;
+        newFrontmatter += `    theme: ${this.settings.htmlTheme}\n`;
+        newFrontmatter += `    code-fold: true\n`;
+
+        // Merge existing frontmatter (if any) with new frontmatter, excluding tags and empty values
         if (frontmatter) {
-            const existingFrontmatter = frontmatter
+            const existingLines = frontmatter
                 .slice(4, -4) // Remove '---' delimiters
-                .split('\n')
-                .filter(line => !line.startsWith('tags:') && !line.trim().startsWith('-'))
-                .join('\n');
-            newFrontmatter += existingFrontmatter + '\n';
+                .split('\n');
+
+            const filteredLines: string[] = [];
+            let skipNextLines = false;
+
+            for (let i = 0; i < existingLines.length; i++) {
+                const line = existingLines[i];
+                const trimmedLine = line.trim();
+
+                // Skip tags and their list items
+                if (trimmedLine.startsWith('tags:')) {
+                    skipNextLines = true;
+                    continue;
+                }
+
+                // Skip list items that are part of tags
+                if (skipNextLines && trimmedLine.startsWith('-')) {
+                    continue;
+                }
+
+                // End of tags section
+                if (skipNextLines && !trimmedLine.startsWith('-')) {
+                    skipNextLines = false;
+                }
+
+                // Check if line is a property (key: value)
+                if (line.includes(':')) {
+                    const colonIndex = line.indexOf(':');
+                    const value = line.slice(colonIndex + 1).trim();
+
+                    // Filter out empty values (empty string, null, undefined, or just quotes)
+                    if (value && value !== '""' && value !== "''" && value !== 'null' && value !== 'undefined') {
+                        filteredLines.push(line);
+                    }
+                } else if (line.trim() !== '') {
+                    // Keep non-empty lines that aren't properties (e.g., multi-line values)
+                    filteredLines.push(line);
+                }
+            }
+
+            if (filteredLines.length > 0) {
+                newFrontmatter += filteredLines.join('\n') + '\n';
+            }
         }
         newFrontmatter += '---\n\n';
 
@@ -266,10 +313,16 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             convertedContent = convertedContent.slice(firstHeaderIndex);
         }
 
+        // Remove button codeblocks from pre-header content
+        preHeaderContent = preHeaderContent.replace(/```button\s*\n[\s\S]*?\n```\s*\n*/g, '');
+
         // Convert Obsidian image syntax before other conversions
         convertedContent = this.convertObsidianImages(convertedContent);
 
         convertedContent = await this.convertEmbeddedNotes(convertedContent);
+
+        // Remove button codeblocks
+        convertedContent = convertedContent.replace(/```button\s*\n[\s\S]*?\n```\s*\n*/g, '');
 
         // Add line breaks before headers
         convertedContent = convertedContent.replace(/^(#+\s.*)/gm, '\n$1');
@@ -581,6 +634,33 @@ class ObsidianToQuartoSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.importTags)
                 .onChange(async (value) => {
                     this.plugin.settings.importTags = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('HTML Theme')
+            .setDesc('Select the theme for Quarto HTML output')
+            .addDropdown(dropdown => dropdown
+                .addOption('cosmo', 'Cosmo')
+                .addOption('flatly', 'Flatly')
+                .addOption('darkly', 'Darkly')
+                .addOption('cerulean', 'Cerulean')
+                .addOption('journal', 'Journal')
+                .addOption('lumen', 'Lumen')
+                .addOption('minty', 'Minty')
+                .addOption('pulse', 'Pulse')
+                .addOption('sandstone', 'Sandstone')
+                .addOption('simplex', 'Simplex')
+                .addOption('sketchy', 'Sketchy')
+                .addOption('slate', 'Slate')
+                .addOption('solar', 'Solar')
+                .addOption('spacelab', 'Spacelab')
+                .addOption('superhero', 'Superhero')
+                .addOption('united', 'United')
+                .addOption('yeti', 'Yeti')
+                .setValue(this.plugin.settings.htmlTheme)
+                .onChange(async (value) => {
+                    this.plugin.settings.htmlTheme = value;
                     await this.plugin.saveSettings();
                 }));
     }
