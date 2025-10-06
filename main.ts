@@ -202,23 +202,35 @@ export default class ObsidianToQuartoPlugin extends Plugin {
 
             // Handle both absolute and relative paths
             let absoluteFilePath: string;
+            let workspaceFolder: string;
+
             if (path.isAbsolute(qmdPath)) {
+                // External path
                 absoluteFilePath = qmdPath;
+                // Use the configured output folder as workspace
+                workspaceFolder = this.settings.outputFolder;
             } else {
                 // Relative to vault
                 if (this.app.vault.adapter instanceof FileSystemAdapter) {
-                    absoluteFilePath = path.join(this.app.vault.adapter.getBasePath(), qmdPath);
+                    const vaultPath = this.app.vault.adapter.getBasePath();
+                    absoluteFilePath = path.join(vaultPath, qmdPath);
+
+                    // Determine workspace folder
+                    if (this.settings.outputFolder) {
+                        // Use configured output folder relative to vault
+                        workspaceFolder = path.join(vaultPath, this.settings.outputFolder);
+                    } else {
+                        // No output folder configured, use vault root
+                        workspaceFolder = vaultPath;
+                    }
                 } else {
                     new Notice('Cannot determine absolute path');
                     return;
                 }
             }
 
-            // Get the folder path
-            const folderPath = path.dirname(absoluteFilePath);
-
-            // Execute code-insiders command to open both folder and file
-            const command = `code-insiders "${folderPath}" "${absoluteFilePath}"`;
+            // Execute code-insiders command to open workspace folder and file
+            const command = `code-insiders "${workspaceFolder}" "${absoluteFilePath}"`;
 
             exec(command, (error, stdout, stderr) => {
                 if (error) {
