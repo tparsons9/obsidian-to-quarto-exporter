@@ -11,6 +11,9 @@ interface ObsidianToQuartoSettings {
     importTags: boolean;
     allowExternalPaths: boolean;
     htmlTheme: string;
+    useQuartoFilters: boolean;
+    generateWikilinksFilter: boolean;
+    customCalloutMappings: string;
 }
 
 const DEFAULT_SETTINGS: ObsidianToQuartoSettings = {
@@ -20,7 +23,10 @@ const DEFAULT_SETTINGS: ObsidianToQuartoSettings = {
     overwriteExisting: false,
     importTags: true,
     allowExternalPaths: false,
-    htmlTheme: 'cosmo'
+    htmlTheme: 'cosmo',
+    useQuartoFilters: true,
+    generateWikilinksFilter: true,
+    customCalloutMappings: '{}'
 }
 
 export default class ObsidianToQuartoPlugin extends Plugin {
@@ -90,7 +96,15 @@ export default class ObsidianToQuartoPlugin extends Plugin {
                     }
 
                     qmdRelativePath = newPath;
-                    const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath);
+
+                    // Generate Quarto filters and get filter paths
+                    const filterPaths = await this.generateQuartoFilters(
+                        this.settings.outputFolder,
+                        newPath,
+                        true
+                    );
+
+                    const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath, filterPaths);
                     fs.writeFileSync(newPath, convertedContent);
 
                     // Update original MD file with bidirectional link
@@ -127,7 +141,22 @@ export default class ObsidianToQuartoPlugin extends Plugin {
                 }
 
                 qmdRelativePath = newPath;
-                const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath);
+
+                // Generate Quarto filters and get filter paths
+                // For vault paths, use the base output folder or vault root
+                const baseFolder = this.settings.outputFolder || '';
+                let absoluteNewPath = newPath;
+                if (this.app.vault.adapter instanceof FileSystemAdapter) {
+                    absoluteNewPath = path.join(this.app.vault.adapter.getBasePath(), newPath);
+                }
+
+                const filterPaths = await this.generateQuartoFilters(
+                    baseFolder,
+                    absoluteNewPath,
+                    false
+                );
+
+                const convertedContent = await this.convertToQuarto(content, activeFile, qmdRelativePath, filterPaths);
                 await this.app.vault.create(newPath, convertedContent);
 
                 // Update original MD file with bidirectional link
@@ -214,7 +243,7 @@ export default class ObsidianToQuartoPlugin extends Plugin {
         return content.replace(/!\[\[([^\]]+?)\]\]/g, '![]($1)');
     }
 
-    async convertToQuarto(content: string, file: TFile, qmdRelativePath?: string): Promise<string> {
+    async convertToQuarto(content: string, file: TFile, qmdRelativePath?: string, filterPaths?: string[]): Promise<string> {
         // Extract frontmatter if it exists
         let frontmatter = '';
         let mainContent = content;
@@ -252,47 +281,70 @@ export default class ObsidianToQuartoPlugin extends Plugin {
         newFrontmatter += `    theme: ${this.settings.htmlTheme}\n`;
         newFrontmatter += `    code-fold: true\n`;
 
-        // Merge existing frontmatter (if any) with new frontmatter, excluding tags and empty values
+        // Add filter references if provided
+        if (filterPaths && filterPaths.length > 0) {
+            newFrontmatter += `filters:\n`;
+            filterPaths.forEach(filterPath => {
+                newFrontmatter += `  - ${filterPath}\n`;
+            });
+        }
+
+        // Merge existing frontmatter (if any) with new frontmatter, excluding tags, empty values, and reserved keys
         if (frontmatter) {
             const existingLines = frontmatter
                 .slice(4, -4) // Remove '---' delimiters
                 .split('\n');
 
             const filteredLines: string[] = [];
-            let skipNextLines = false;
+            let skipProperty = false;
+            let currentIndent = 0;
+
+            // Keys that we're already handling or should skip
+            const reservedKeys = ['title', 'date', 'tags', 'note', 'format', 'filters', 'code', 'aliases'];
 
             for (let i = 0; i < existingLines.length; i++) {
                 const line = existingLines[i];
                 const trimmedLine = line.trim();
 
-                // Skip tags and their list items
-                if (trimmedLine.startsWith('tags:')) {
-                    skipNextLines = true;
+                // Empty lines
+                if (trimmedLine === '') {
                     continue;
                 }
 
-                // Skip list items that are part of tags
-                if (skipNextLines && trimmedLine.startsWith('-')) {
-                    continue;
-                }
+                // Determine if this is a top-level property (starts at column 0)
+                const lineIndent = line.length - line.trimStart().length;
 
-                // End of tags section
-                if (skipNextLines && !trimmedLine.startsWith('-')) {
-                    skipNextLines = false;
-                }
+                if (lineIndent === 0 && trimmedLine.includes(':')) {
+                    // This is a new top-level property
+                    const propertyKey = trimmedLine.split(':')[0].trim();
 
-                // Check if line is a property (key: value)
-                if (line.includes(':')) {
-                    const colonIndex = line.indexOf(':');
-                    const value = line.slice(colonIndex + 1).trim();
+                    // Check if this is a reserved key
+                    if (reservedKeys.includes(propertyKey)) {
+                        skipProperty = true;
+                        currentIndent = lineIndent;
+                        continue;
+                    } else {
+                        skipProperty = false;
+                        currentIndent = lineIndent;
 
-                    // Filter out empty values (empty string, null, undefined, or just quotes)
-                    if (value && value !== '""' && value !== "''" && value !== 'null' && value !== 'undefined') {
+                        // Check if property has a value
+                        const colonIndex = line.indexOf(':');
+                        const value = line.slice(colonIndex + 1).trim();
+
+                        // Filter out empty values
+                        if (!value || value === '""' || value === "''" || value === 'null' || value === 'undefined') {
+                            skipProperty = true;
+                            continue;
+                        }
+
                         filteredLines.push(line);
                     }
-                } else if (line.trim() !== '') {
-                    // Keep non-empty lines that aren't properties (e.g., multi-line values)
+                } else if (!skipProperty && lineIndent > 0) {
+                    // This is an indented line (part of the current property)
                     filteredLines.push(line);
+                } else if (skipProperty && lineIndent > currentIndent) {
+                    // Skip indented lines that belong to a skipped property
+                    continue;
                 }
             }
 
@@ -327,14 +379,16 @@ export default class ObsidianToQuartoPlugin extends Plugin {
         // Add line breaks before headers
         convertedContent = convertedContent.replace(/^(#+\s.*)/gm, '\n$1');
 
-        // Convert Obsidian callouts to Quarto callouts
-        convertedContent = convertedContent.replace(
-            /> \[!(\w+)\](.*?)\n((?:>.*\n?)*)/g,
-            (_, type, title, content) => {
-                const quartoType = this.mapCalloutType(type);
-                return `::: {.callout-${quartoType}}\n${title.trim() ? `## ${title.trim()}\n` : ''}${content.replace(/^>/gm, '').trim()}\n:::\n\n`;
-            }
-        );
+        // Convert Obsidian callouts to Quarto callouts (only if not using filters)
+        if (!this.settings.useQuartoFilters) {
+            convertedContent = convertedContent.replace(
+                /> \[!(\w+)\](.*?)\n((?:>.*\n?)*)/g,
+                (_, type, title, content) => {
+                    const quartoType = this.mapCalloutType(type);
+                    return `::: {.callout-${quartoType}}\n${title.trim() ? `## ${title.trim()}\n` : ''}${content.replace(/^>/gm, '').trim()}\n:::\n\n`;
+                }
+            );
+        }
 
         // Combine all parts
         return newFrontmatter + preHeaderContent + convertedContent;
@@ -467,6 +521,194 @@ export default class ObsidianToQuartoPlugin extends Plugin {
             'quote': 'quote'
         };
         return typeMap[obsidianType.toLowerCase()] || 'note';
+    }
+
+    private getCalloutMappings(): Record<string, string> {
+        // Default mappings for Obsidian callouts to Quarto callout types
+        const defaultMappings: Record<string, string> = {
+            'note': 'note',
+            'info': 'note',
+            'tip': 'tip',
+            'success': 'tip',
+            'question': 'note',
+            'warning': 'warning',
+            'failure': 'warning',
+            'danger': 'caution',
+            'bug': 'caution',
+            'example': 'note',
+            'quote': 'note',
+            'important': 'important'
+        };
+
+        // Parse custom mappings from settings
+        let customMappings: Record<string, string> = {};
+        try {
+            if (this.settings.customCalloutMappings && this.settings.customCalloutMappings.trim() !== '') {
+                customMappings = JSON.parse(this.settings.customCalloutMappings);
+            }
+        } catch (error) {
+            console.error('Error parsing custom callout mappings:', error);
+            new Notice('Invalid custom callout mappings JSON. Using defaults only.');
+        }
+
+        // Merge custom mappings with defaults (custom takes precedence)
+        return { ...defaultMappings, ...customMappings };
+    }
+
+    private generateObsidianCalloutsFilter(filtersDir: string): void {
+        const mappings = this.getCalloutMappings();
+
+        // Generate Lua table entries for callout mappings
+        const mappingEntries = Object.entries(mappings)
+            .map(([key, value]) => `  ["${key}"] = "${value}"`)
+            .join(',\n');
+
+        const luaContent = `-- obsidian-callouts.lua
+-- Converts Obsidian callout syntax to Quarto callout syntax
+-- Auto-generated by Obsidian to Quarto Exporter plugin
+
+-- Callout type mappings to Quarto's 5 standard types
+-- Unmapped callout types default to "note"
+local callout_mappings = {
+${mappingEntries}
+}
+
+function BlockQuote(el)
+  -- Check if this is an Obsidian callout
+  if #el.content == 0 then return el end
+
+  local first_block = el.content[1]
+  if first_block.t ~= "Para" and first_block.t ~= "Plain" then
+    return el
+  end
+
+  if #first_block.content == 0 then return el end
+
+  -- Check if first inline starts with [!
+  local first_inline = first_block.content[1]
+  if first_inline.t ~= "Str" then return el end
+
+  local callout_match = first_inline.text:match("^%[!([^%]]+)%]")
+  if not callout_match then return el end
+
+  local callout_type = callout_match
+  -- Map to Quarto type, default to "note" if not found
+  local mapped_type = callout_mappings[callout_type:lower()] or "note"
+
+  -- Extract title (everything after [!type])
+  local title = first_inline.text:match("^%[![^%]]+%]%s*(.+)$")
+
+  -- Remove the [!type] Title line
+  table.remove(el.content, 1)
+
+  -- If there's a title, add it as a header
+  local content = {}
+  if title and title ~= "" then
+    table.insert(content, pandoc.Header(2, {pandoc.Str(title)}))
+  end
+
+  -- Add the rest of the content
+  for _, block in ipairs(el.content) do
+    table.insert(content, block)
+  end
+
+  -- Create the callout div
+  return pandoc.Div(content, {class = "callout-" .. mapped_type})
+end
+`;
+
+        const filterPath = path.join(filtersDir, 'obsidian-callouts.lua');
+
+        try {
+            fs.writeFileSync(filterPath, luaContent);
+        } catch (error) {
+            console.error('Error writing Obsidian callouts filter:', error);
+            throw error;
+        }
+    }
+
+    private generateWikilinksFilter(filtersDir: string): void {
+        const luaContent = `-- wikilinks-filter.lua
+-- Converts Obsidian wikilinks to plain text
+-- Auto-generated by Obsidian to Quarto Exporter plugin
+
+function Str(el)
+  -- Handle complete wikilinks in a single Str element
+  local text = el.text
+
+  -- Replace [[link|alias]] with alias
+  text = text:gsub("%[%[([^|%]]+)|([^%]]+)%]%]", "%2")
+
+  -- Replace [[link]] with link
+  text = text:gsub("%[%[([^%]]+)%]%]", "%1")
+
+  if text ~= el.text then
+    return pandoc.Str(text)
+  end
+  return el
+end
+`;
+
+        const filterPath = path.join(filtersDir, 'wikilinks-filter.lua');
+
+        try {
+            fs.writeFileSync(filterPath, luaContent);
+        } catch (error) {
+            console.error('Error writing wikilinks filter:', error);
+            throw error;
+        }
+    }
+
+    private async generateQuartoFilters(outputBaseFolder: string, qmdFilePath: string, isExternalPath: boolean): Promise<string[]> {
+        if (!this.settings.useQuartoFilters) {
+            return [];
+        }
+
+        // Create filters directory - determine absolute path
+        let filtersDir: string;
+        if (isExternalPath) {
+            filtersDir = path.join(outputBaseFolder, 'filters');
+        } else {
+            // For vault paths, need absolute path for fs operations
+            if (this.app.vault.adapter instanceof FileSystemAdapter) {
+                const vaultPath = this.app.vault.adapter.getBasePath();
+                filtersDir = path.join(vaultPath, outputBaseFolder, 'filters');
+            } else {
+                throw new Error('Cannot generate filters: vault adapter is not FileSystemAdapter');
+            }
+        }
+
+        try {
+            // Always use fs.mkdirSync for creating the directory (works for both cases)
+            if (!fs.existsSync(filtersDir)) {
+                fs.mkdirSync(filtersDir, { recursive: true });
+            }
+
+            // Generate filters
+            this.generateObsidianCalloutsFilter(filtersDir);
+            if (this.settings.generateWikilinksFilter) {
+                this.generateWikilinksFilter(filtersDir);
+            }
+
+            // Calculate relative paths from QMD file to filters
+            const qmdDir = path.dirname(qmdFilePath);
+            const calloutsFilterPath = path.join(filtersDir, 'obsidian-callouts.lua');
+            const wikilinksFilterPath = path.join(filtersDir, 'wikilinks-filter.lua');
+
+            const relativeCallouts = path.relative(qmdDir, calloutsFilterPath);
+            const relativeWikilinks = path.relative(qmdDir, wikilinksFilterPath);
+
+            const filterPaths = [relativeCallouts];
+            if (this.settings.generateWikilinksFilter) {
+                filterPaths.push(relativeWikilinks);
+            }
+
+            return filterPaths;
+        } catch (error) {
+            console.error('Error generating Quarto filters:', error);
+            new Notice(`Failed to generate Quarto filters: ${error.message}`);
+            return [];
+        }
     }
 
     private slugify(text: string): string {
@@ -661,6 +903,40 @@ class ObsidianToQuartoSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.htmlTheme)
                 .onChange(async (value) => {
                     this.plugin.settings.htmlTheme = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Quarto Filter Settings Section
+        containerEl.createEl('h3', { text: 'Quarto Filter Settings' });
+
+        new Setting(containerEl)
+            .setName('Use Quarto Filters')
+            .setDesc('Generate Lua filters to convert Obsidian callouts at Quarto render time. When disabled, callouts are converted inline in the QMD file.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.useQuartoFilters)
+                .onChange(async (value) => {
+                    this.plugin.settings.useQuartoFilters = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Generate Wikilinks Filter')
+            .setDesc('Generate a Lua filter to convert Obsidian wikilinks to plain text in Quarto output.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.generateWikilinksFilter)
+                .onChange(async (value) => {
+                    this.plugin.settings.generateWikilinksFilter = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Custom Callout Mappings')
+            .setDesc('Map custom Obsidian callout types to standard Quarto callout types (note, tip, warning, caution, important). Format: {"custom": "note", "rocket": "tip"}')
+            .addTextArea(text => text
+                .setPlaceholder('{"custom": "note"}')
+                .setValue(this.plugin.settings.customCalloutMappings)
+                .onChange(async (value) => {
+                    this.plugin.settings.customCalloutMappings = value;
                     await this.plugin.saveSettings();
                 }));
     }
